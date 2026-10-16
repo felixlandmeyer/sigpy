@@ -815,6 +815,82 @@ def runge_kutta(
     return k1 / 6 + k2 / 3 + k3 / 3 + k4 / 6
 
 
+@nb.njit(cache=True)
+def _speed_sweeps(s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma):
+    """Calculate feasible speeds with compiled forward and backward sweeps.
+
+    Parameters
+    ----------
+    s : ndarray
+        Arc-length grid.
+    k : ndarray
+        Padded curvature samples.
+    phi : ndarray
+        Speed limits at arc-length samples.
+    ds, st0 : float
+        Integration step and initial speed offset.
+    g0, gfin : float or None
+        Initial and final gradient magnitudes in G/cm.
+    gmax, smax, gamma : float
+        Gradient limit, slew limit and gyromagnetic ratio in solver units.
+
+    Returns
+    -------
+    sta, stb : tuple of ndarray
+        Forward and backward feasible speed profiles.
+
+    Notes
+    -----
+    Preserves the original solver's indexing and Runge-Kutta calls.
+    Compilation uses no fast-math transformations.
+    """
+    # Get the start
+    sta = np.zeros_like(s)
+    sta[0] = min(g0 * gamma + st0, gamma * gmax)
+
+    # solve ODE forward
+    for n in range(1, s.shape[0]):
+        kpos = n
+        dstds = runge_kutta(ds, sta[n - 1], k[kpos : kpos + 4], smax)
+
+        if dstds is None:
+            sta[n] = phi[n]
+        else:
+            tmpst = sta[n - 1] + dstds
+            sta[n] = min(tmpst, phi[n])
+
+    stb = 0 * s
+    if gfin is None:
+        stb[-1] = sta[-1]
+    else:
+        stb[-1] = min(max(gfin * gamma, st0), gamma * gmax)
+
+    # solve ODE backwards
+    for n in range(s.shape[0] - 2, 0, -1):
+        kpos_end = n  # to 0
+        kpos = kpos_end + 3
+        dstds = runge_kutta(ds, stb[n + 1], k[kpos : (kpos - 3) : -1], smax)
+
+        if dstds is None:
+            stb[n] = phi[n - 1]
+        else:
+            tmpst = stb[n + 1] + dstds
+            stb[n] = min(tmpst, phi[n - 1])
+
+    # Fix last point which is indexed a bit off
+    n = 0
+    kpos_end = n
+    kpos = kpos_end + 3
+    dstds = runge_kutta(ds, stb[n + 1], k[kpos::-1], smax)
+    if dstds is None:
+        stb[n] = phi[n * 2 - 1]
+    else:
+        tmpst = stb[n + 1] + dstds
+        stb[n] = min(tmpst, phi[n - 1])
+
+    return sta, stb
+
+
 #  Arc length code translated from matlab
 #    (c) Michael Lustig 2005
 #    modified 2006 and 2007
@@ -822,36 +898,63 @@ def runge_kutta(
 def min_time_gradient(
     c: np.ndarray, g0=0, gfin=None, gmax=4, smax=15, dt=4e-3, gamma=4.257
 ):
-    r"""
-    Given a k-space trajectory c(n), gradient and slew constraints. This
-    function will return a new parametrization that will meet these
-    constraint while getting from one point to the other in minimum time.
+    """Time-optimise a curve and return waveforms at common timestamps.
 
-    Args:
-        c (array): Curve in k-space given in any parametrization [1/cm]
-                        Nx3 real array
-        g0 (float): Initial gradient amplitude (leave empty for g0 = 0)
-        gfin (float): Gradient value at the end of the trajectory. If not
-                        possible, the result would be the largest possible
-                        ampltude. (Leave empty if you don't care to get
-                        maximum gradient.)
-        gmax (float): Maximum gradient [G/cm] (3.9 default)
-        smax (float): Maximum slew [G/Cm/ms]  (14.5 default)
-        dt (float): Sampling time interval [ms] (4e-3 default)
-        gamma (float): Gyromagnetic ratio
+    Parameters
+    ----------
+    c : ndarray, shape (N, 3)
+        Input k-space curve in cm^-1.
+    g0 : float or None, optional
+        Requested initial gradient magnitude in G/cm. Default is zero.
+    gfin : float or None, optional
+        Requested final gradient magnitude in G/cm. None leaves it free.
+    gmax : float, optional
+        Gradient magnitude limit in G/cm. Default is 4.
+    smax : float, optional
+        Slew magnitude limit in G/cm/ms. Default is 15.
+    dt : float, optional
+        Output sampling interval in ms. Default is 0.004.
+    gamma : float, optional
+        Reduced gyromagnetic ratio in kHz/G. Default is 4.257.
 
-    Returns:
-        tuple: (g, k, s, t) tuple containing
+    Returns
+    -------
+    g : ndarray, shape (M, 3)
+        Gradients in G/cm, interpolated from interval averages to t.
+    k : ndarray, shape (M, 3)
+        Time-optimised curve in cm^-1 relative to its initial position.
+        Add the original input c[0] to recover absolute positions.
+    s : ndarray, shape (M, 3)
+        Slew in G/cm/ms, evaluated at the same timestamps as g and k.
+    t : ndarray, shape (M,)
+        Output timestamps in ms.
 
-        - **g** - (array): gradient waveform [G/cm]
-        - **k** - (array): exact k-space corresponding to gradient g.
-        - **s** - (array): slew rate [G/cm/ms]
-        - **time** - (array):  sampled time
+    Raises
+    ------
+    ValueError
+        If fewer than three output samples cover the optimised curve.
 
-    References:
-        Lustig M, Kim SJ, Pauly JM. A fast method for designing time-optimal
-        gradient waveforms for arbitrary k-space trajectories. IEEE Trans Med
-        Imaging. 2008;27(6):866-873. doi:10.1109/TMI.2008.922699
+    Notes
+    -----
+    Forward/backward arc-length sweeps are compiled with Numba and cached.
+    The first call for a new argument signature may include compilation time.
+    The numerical method is unchanged. Output k uses its sampled curve
+    directly, equivalent to cumulatively integrating interval-average
+    gradients. It avoids trapezoidal integration of interval averages as
+    though they were gradient values at interval boundaries.
+
+    g is interpolated from interval centres, with linear extrapolation at
+    the endpoints. s uses central differences with first-order one-sided
+    endpoint differences. Both are pointwise approximations: trapezoidal
+    integration of returned g need not reproduce k exactly. Check sampled
+    hardware limits after interpolation and after scanner-raster conversion.
+    Unlike the original implementation, s has M rather than M-1 samples.
+
+    References
+    ----------
+    Lustig M, Kim SJ, Pauly JM. A fast method for designing time-optimal
+    gradient waveforms for arbitrary k-space trajectories. IEEE Trans Med
+    Imaging. 2008;27(6):866-873. doi:10.1109/TMI.2008.922699.
     """
 
     def sdotmax(
@@ -932,49 +1035,9 @@ def min_time_gradient(
     # extend for the Runge-Kutte method
     k = np.pad(k, (0, 3), "constant", constant_values=(0,))
 
-    # Get the start
-    sta = np.zeros_like(s)
-    sta[0] = min(g0 * gamma + st0, gamma * gmax)
-
-    # solve ODE forward
-    for n in range(1, s.shape[0]):
-        kpos = n
-        dstds = runge_kutta(ds, sta[n - 1], k[kpos : kpos + 4], smax)
-
-        if dstds is None:
-            sta[n] = phi[n]
-        else:
-            tmpst = sta[n - 1] + dstds
-            sta[n] = min(tmpst, phi[n])
-
-    stb = 0 * s
-    if gfin is None:
-        stb[-1] = sta[-1]
-    else:
-        stb[-1] = min(max(gfin * gamma, st0), gamma * gmax)
-
-    # solve ODE backwards
-    for n in range(s.shape[0] - 2, 0, -1):
-        kpos_end = n  # to 0
-        kpos = kpos_end + 3
-        dstds = runge_kutta(ds, stb[n + 1], k[kpos : (kpos - 3) : -1], smax)
-
-        if dstds is None:
-            stb[n] = phi[n - 1]
-        else:
-            tmpst = stb[n + 1] + dstds
-            stb[n] = min(tmpst, phi[n - 1])
-
-    # Fix last point which is indexed a bit off
-    n = 0
-    kpos_end = n
-    kpos = kpos_end + 3
-    dstds = runge_kutta(ds, stb[n + 1], k[kpos::-1], smax)
-    if dstds is None:
-        stb[n] = phi[n * 2 - 1]
-    else:
-        tmpst = stb[n + 1] + dstds
-        stb[n] = min(tmpst, phi[n - 1])
+    sta, stb = _speed_sweeps(
+        s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma
+    )
 
     # take the minimum of the curves
     ds = s[1] - s[0]
@@ -987,13 +1050,36 @@ def min_time_gradient(
 
     t_of_s = interpolate.CubicSpline(t_of_s, s)
     s_of_t = t_of_s(t)
-    c = np.squeeze(cs(s_of_t))
+    c = cs(s_of_t)
 
-    g = np.diff(c, axis=0, append=np.zeros((1, 3))) / gamma / dt
-    g[-1, :] = g[-2, :] + g[-2, :] - g[-3, :]
+    if t.size < 3:
+        raise ValueError("At least three output samples are required; reduce dt.")
 
-    k = integrate.cumulative_trapezoid(g, t, initial=0, axis=0) * gamma
+    # The solver already knows the curve at the output timestamps.
+    # Keep relative k-space, as in the original SigPy return convention.
+    # This is equivalent to summing gamma * interval_g * interval_dt.
+    k = c - c[0]
 
-    s = np.diff(g, axis=0) / dt
+    # Forward differences are average gradients over time intervals,
+    # not gradient values at the interval boundaries.
+    interval_dt = np.diff(t)
+    interval_g = np.diff(c, axis=0) / (gamma * interval_dt[:, None])
+    interval_t = (t[:-1] + t[1:]) / 2
+
+    # Interpolate interval-centre values onto the same timestamps as k.
+    g = np.column_stack([
+        np.interp(t, interval_t, interval_g[:, axis])
+        for axis in range(3)
+    ])
+
+    # The first and last timestamps lie half an interval outside the
+    # centres. Use linear extrapolation there rather than constant padding.
+    first_slope = (interval_g[1] - interval_g[0]) / (interval_t[1] - interval_t[0])
+    last_slope = (interval_g[-1] - interval_g[-2]) / (interval_t[-1] - interval_t[-2])
+    g[0] = interval_g[0] + first_slope * (t[0] - interval_t[0])
+    g[-1] = interval_g[-1] + last_slope * (t[-1] - interval_t[-1])
+
+    # Return one slew value per timestamp, matching the shapes of g and k.
+    s = np.gradient(g, dt, axis=0, edge_order=1)
 
     return g, k, s, t
