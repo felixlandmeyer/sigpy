@@ -791,26 +791,28 @@ def runge_kutta(
     temp = gamma**2 * smax**2 - abs(kvals[0]) ** 2 * st**4
     if temp < 0.0:
         return None
+    # Each RK stage is already an increment including ds.
+    # Intermediate speeds must not multiply that increment by ds again.
     k1 = ds / st * math.sqrt(temp)
 
     temp = (
-        gamma**2 * smax**2 - abs(kvals[1]) ** 2 * (st + ds * k1 / 2) ** 4
+        gamma**2 * smax**2 - abs(kvals[1]) ** 2 * (st + k1 / 2) ** 4
     )
     if temp < 0.0:
         return None
-    k2 = ds / (st + ds * k1 / 2) * math.sqrt(temp)
+    k2 = ds / (st + k1 / 2) * math.sqrt(temp)
 
     temp = (
-        gamma**2 * smax**2 - abs(kvals[1]) ** 2 * (st + ds * k2 / 2) ** 4
+        gamma**2 * smax**2 - abs(kvals[1]) ** 2 * (st + k2 / 2) ** 4
     )
     if temp < 0.0:
         return None
-    k3 = ds / (st + ds * k2 / 2) * math.sqrt(temp)
+    k3 = ds / (st + k2 / 2) * math.sqrt(temp)
 
-    temp = gamma**2 * smax**2 - abs(kvals[2]) ** 2 * (st + ds * k3) ** 4
+    temp = gamma**2 * smax**2 - abs(kvals[2]) ** 2 * (st + k3) ** 4
     if temp < 0.0:
         return None
-    k4 = ds / (st + ds * k3) * math.sqrt(temp)
+    k4 = ds / (st + k3) * math.sqrt(temp)
 
     return k1 / 6 + k2 / 3 + k3 / 3 + k4 / 6
 
@@ -841,7 +843,7 @@ def _speed_sweeps(s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma):
 
     Notes
     -----
-    Preserves the original solver's indexing and Runge-Kutta calls.
+    Uses the solver's supplied gamma in both integration directions.
     Compilation uses no fast-math transformations.
     """
     # Get the start
@@ -851,7 +853,7 @@ def _speed_sweeps(s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma):
     # solve ODE forward
     for n in range(1, s.shape[0]):
         kpos = n
-        dstds = runge_kutta(ds, sta[n - 1], k[kpos : kpos + 4], smax)
+        dstds = runge_kutta(ds, sta[n - 1], k[kpos : kpos + 4], smax, gamma)
 
         if dstds is None:
             sta[n] = phi[n]
@@ -869,7 +871,7 @@ def _speed_sweeps(s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma):
     for n in range(s.shape[0] - 2, 0, -1):
         kpos_end = n  # to 0
         kpos = kpos_end + 3
-        dstds = runge_kutta(ds, stb[n + 1], k[kpos : (kpos - 3) : -1], smax)
+        dstds = runge_kutta(ds, stb[n + 1], k[kpos : (kpos - 3) : -1], smax, gamma)
 
         if dstds is None:
             stb[n] = phi[n - 1]
@@ -881,7 +883,7 @@ def _speed_sweeps(s, k, phi, ds, st0, g0, gfin, gmax, smax, gamma):
     n = 0
     kpos_end = n
     kpos = kpos_end + 3
-    dstds = runge_kutta(ds, stb[n + 1], k[kpos::-1], smax)
+    dstds = runge_kutta(ds, stb[n + 1], k[kpos::-1], smax, gamma)
     if dstds is None:
         stb[n] = phi[n * 2 - 1]
     else:
